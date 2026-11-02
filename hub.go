@@ -16,8 +16,9 @@ var (
 )
 
 const (
-	rebuildRetryInterval = 50 * time.Millisecond
-	rebuildRetryLimit    = 2 * time.Second
+	findGameRetryInterval = 50 * time.Millisecond
+	findGameRetryLimit    = 2 * time.Second
+	resignRetryInterval   = time.Second
 )
 
 // Session is one player's live connection.
@@ -44,11 +45,13 @@ type disconnectTimer struct {
 // if it has no active game, and it can be in the queue once.
 //
 // mu is never held across a database call: the database has one connection,
-// and Broadcast runs while the projector is working.
+// and Broadcast runs while the projector is working. For the same reason,
+// catchUp, which ends in Broadcast, is never called with mu held.
 type Hub struct {
 	db       *sql.DB
 	commands *Commands
 	timeout  time.Duration
+	catchUp  func(context.Context) error
 
 	mu       sync.Mutex
 	sessions map[string]*Session // by player key
@@ -56,11 +59,14 @@ type Hub struct {
 	timers   map[timerKey]*disconnectTimer
 }
 
-func NewHub(db *sql.DB, commands *Commands, timeout time.Duration) *Hub {
+// NewHub makes a Hub. catchUp is Projector.CatchUp: it lets the hub see a
+// player's own events before deciding something that depends on them.
+func NewHub(db *sql.DB, commands *Commands, timeout time.Duration, catchUp func(context.Context) error) *Hub {
 	return &Hub{
 		db:       db,
 		commands: commands,
 		timeout:  timeout,
+		catchUp:  catchUp,
 		sessions: map[string]*Session{},
 		timers:   map[timerKey]*disconnectTimer{},
 	}
@@ -76,9 +82,7 @@ func (h *Hub) Connect(_ context.Context, player PlayerRef) *Session {
 	h.mu.Lock()
 	if old, ok := h.sessions[player.Key]; ok {
 		close(old.closed)
-		if i := slices.Index(h.queue, old); i >= 0 {
-			h.queue[i] = s // keep their place in line
-		}
+		h.removeFromQueue(old) // the new session starts at the menu
 	}
 	h.sessions[player.Key] = s
 
@@ -114,30 +118,34 @@ func (h *Hub) Disconnect(ctx context.Context, s *Session) {
 	// The context of a connection that just ended is usually already cancelled.
 	game, ok, err := h.findGame(context.WithoutCancel(ctx), key)
 	if err != nil {
-		log.Printf("hub: no disconnect timer for %s: %v", s.Player.Name, err)
-		return
+		log.Printf("hub: finding %s's game: %v", s.Player.Name, err)
 	}
 	if ok && h.startTimer(game.GameID, key, h.timeout) {
 		h.Broadcast() // the opponent's countdown starts
 	}
 }
 
-// findGame waits out a projection rebuild so that it can't lose a timer.
+// findGame catches the projection up, then reads it, so the answer includes
+// every event written before the call. It retries a failed catch-up or a
+// rebuild. If catching up never succeeds, it returns the error along with
+// whatever the projection showed.
 func (h *Hub) findGame(ctx context.Context, playerKey string) (ActiveGame, bool, error) {
-	giveUp := time.Now().Add(rebuildRetryLimit)
+	giveUp := time.Now().Add(findGameRetryLimit)
 	for {
+		catchUpErr := h.catchUp(ctx)
 		game, ok, err := GetActiveGameForPlayer(ctx, h.db, playerKey)
-		if !errors.Is(err, ErrProjectionUnavailable) || time.Now().After(giveUp) {
-			return game, ok, err
+		retry := catchUpErr != nil || errors.Is(err, ErrProjectionUnavailable)
+		if !retry || ctx.Err() != nil || time.Now().After(giveUp) {
+			return game, ok, errors.Join(catchUpErr, err)
 		}
-		time.Sleep(rebuildRetryInterval)
+		time.Sleep(findGameRetryInterval)
 	}
 }
 
 // JoinQueue puts a player in line and starts a game if two are waiting. The
 // first in line plays White.
 func (h *Hub) JoinQueue(ctx context.Context, s *Session) error {
-	_, inGame, err := GetActiveGameForPlayer(ctx, h.db, s.Player.Key)
+	_, inGame, err := h.findGame(ctx, s.Player.Key)
 	if err != nil {
 		return err
 	}
@@ -285,5 +293,10 @@ func (h *Hub) expire(key timerKey, entry *disconnectTimer) {
 	err := h.commands.Resign(context.Background(), key.gameID, key.playerKey)
 	if err != nil && !errors.Is(err, ErrGameOver) {
 		log.Printf("hub: resigning %s from %s: %v", key.playerKey, key.gameID, err)
+		// Try again soon. startTimer skips a player who has reconnected, and if
+		// the game has ended, the next Resign returns ErrGameOver.
+		if h.startTimer(key.gameID, key.playerKey, resignRetryInterval) {
+			h.Broadcast() // the opponent's deadline moved
+		}
 	}
 }

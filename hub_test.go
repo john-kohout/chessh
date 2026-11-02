@@ -39,9 +39,10 @@ func newHubFixture(t *testing.T, timeout time.Duration) *hubFixture {
 	db := testDB(t)
 	store := NewEventStore(db)
 	commands := NewCommands(store, nil)
-	hub := NewHub(db, commands, timeout)
-	stopTimersAtCleanup(t, hub)
-	f := &hubFixture{t, db, store, commands, NewProjector(db, store, hub.Broadcast, ActiveGames{}), hub}
+	f := &hubFixture{t: t, db: db, store: store, commands: commands}
+	f.hub = NewHub(db, commands, timeout, func(ctx context.Context) error { return f.projector.CatchUp(ctx) })
+	f.projector = NewProjector(db, store, f.hub.Broadcast, ActiveGames{})
+	stopTimersAtCleanup(t, f.hub)
 	f.catchUp()
 	return f
 }
@@ -84,6 +85,16 @@ func (f *hubFixture) startGame() (gameID string, white, black *Session) {
 	f.catchUp()
 	game := f.activeGame(alice)
 	return game.GameID, sessions[0], sessions[1]
+}
+
+// onlyGameID reads the event store, for tests where no projection shows the game.
+func (f *hubFixture) onlyGameID() string {
+	f.t.Helper()
+	var gameID string
+	if err := f.db.QueryRow(`SELECT game_id FROM events LIMIT 1`).Scan(&gameID); err != nil {
+		f.t.Fatal(err)
+	}
+	return gameID
 }
 
 func (f *hubFixture) activeGame(p PlayerRef) ActiveGame {
@@ -188,31 +199,32 @@ func TestQueueDoesNotMatchSameKey(t *testing.T) {
 	ctx := context.Background()
 	first := f.join(alice)[0]
 	second := f.hub.Connect(ctx, alice)
-
-	wantOnlyInQueue := func() {
-		t.Helper()
-		f.hub.mu.Lock()
-		defer f.hub.mu.Unlock()
-		if len(f.hub.queue) != 1 || f.hub.queue[0] != second {
-			t.Fatalf("queue has %d entries, want only the new session", len(f.hub.queue))
-		}
-	}
-	wantOnlyInQueue() // reconnecting replaced the entry
-	if err := f.hub.JoinQueue(ctx, second); err != nil {
-		t.Fatal(err)
-	}
-	wantOnlyInQueue() // joining again changed nothing
-	if n := countEvents(t, f.db); n != 0 {
-		t.Fatalf("%d events, want no game", n)
-	}
 	if !isClosed(first) {
 		t.Fatal("first session was not closed")
 	}
 
-	f.join(bob)
+	f.join(bob) // alice left the line when she reconnected, so bob waits
+	if n := countEvents(t, f.db); n != 0 {
+		t.Fatalf("%d events, want no game", n)
+	}
+
+	if err := f.hub.JoinQueue(ctx, second); err != nil { // she chooses Play
+		t.Fatal(err)
+	}
 	f.catchUp()
-	if game := f.activeGame(bob); game.White != alice || game.Black != bob {
-		t.Fatalf("game = %+v, want alice White and bob Black", game)
+	if game := f.activeGame(alice); game.White != bob || game.Black != alice {
+		t.Fatalf("game = %+v, want bob White and alice Black", game)
+	}
+}
+
+func TestQueueSameKeyJoiningTwiceDoesNotMatch(t *testing.T) {
+	f := newHubFixture(t, longTimeout)
+	first := f.join(alice)[0]
+	if err := f.hub.JoinQueue(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	if n := countEvents(t, f.db); n != 0 {
+		t.Fatalf("%d events, want no game", n)
 	}
 }
 
@@ -253,6 +265,19 @@ func TestJoinQueueRefusesPlayerWithActiveGame(t *testing.T) {
 	f.catchUp()
 	if f.hasActiveGame(carol) {
 		t.Fatal("carol was matched with a player who already has a game")
+	}
+}
+
+func TestJoinQueueRightAfterStartGameIsRefused(t *testing.T) {
+	f := newHubFixture(t, longTimeout)
+	ctx := context.Background()
+	first := f.join(alice, bob)[0] // no catchUp: only JoinQueue can bring the projection up to date
+
+	if err := f.hub.JoinQueue(ctx, first); !errors.Is(err, ErrAlreadyInGame) {
+		t.Fatalf("got %v, want ErrAlreadyInGame", err)
+	}
+	if err := f.hub.JoinQueue(ctx, f.hub.Connect(ctx, bob)); !errors.Is(err, ErrAlreadyInGame) {
+		t.Fatalf("after reconnecting: got %v, want ErrAlreadyInGame", err)
 	}
 }
 
@@ -325,23 +350,70 @@ func TestDisconnectIgnoresCancelledContext(t *testing.T) {
 	}
 }
 
+func TestDisconnectRightAfterStartGameGetsTimer(t *testing.T) {
+	f := newHubFixture(t, shortTimeout)
+	first := f.join(alice, bob)[0] // no catchUp: only Disconnect can bring the projection up to date
+
+	f.hub.Disconnect(context.Background(), first)
+	f.waitForResignation(f.onlyGameID(), "black")
+}
+
+func TestDisconnectRetriesWhenCatchUpFails(t *testing.T) {
+	f := newHubFixture(t, longTimeout)
+	first := f.join(alice, bob)[0]
+	calls := 0
+	f.hub.catchUp = func(ctx context.Context) error {
+		if calls++; calls <= 2 {
+			return errors.New("busy")
+		}
+		return f.projector.CatchUp(ctx)
+	}
+
+	f.hub.Disconnect(context.Background(), first)
+	if _, ok := f.hub.OpponentDeadline(f.onlyGameID(), alice.Key); !ok {
+		t.Fatal("a failed catch-up lost the timer")
+	}
+}
+
 func TestDisconnectRetriesDuringRebuild(t *testing.T) {
 	f := newHubFixture(t, longTimeout)
 	gameID, white, _ := f.startGame()
 	if _, err := f.db.Exec(`DROP TABLE active_games`); err != nil {
 		t.Fatal(err)
 	}
+	calls := 0
+	f.hub.catchUp = func(ctx context.Context) error {
+		if calls++; calls <= 2 {
+			return nil // the table is still missing
+		}
+		return f.projector.CatchUp(ctx)
+	}
 
-	done := make(chan struct{})
-	go func() {
-		f.hub.Disconnect(context.Background(), white)
-		close(done)
-	}()
-	time.Sleep(120 * time.Millisecond) // long enough for a retry or two
-	f.catchUp()
-	<-done
+	f.hub.Disconnect(context.Background(), white)
 	if _, ok := f.hub.OpponentDeadline(gameID, alice.Key); !ok {
 		t.Fatal("the rebuild lost the timer")
+	}
+}
+
+func TestQueueAndDisconnectWhenCatchUpKeepsFailing(t *testing.T) {
+	f := newHubFixture(t, longTimeout)
+	ctx := context.Background()
+	gameID, white, _ := f.startGame()
+	carolSession := f.hub.Connect(ctx, carol)
+	f.hub.catchUp = func(context.Context) error { return errors.New("busy") }
+
+	var joinErr error
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); joinErr = f.hub.JoinQueue(ctx, carolSession) }()
+	go func() { defer wg.Done(); f.hub.Disconnect(ctx, white) }()
+	wg.Wait()
+
+	if joinErr == nil {
+		t.Fatal("JoinQueue accepted a player without an up-to-date projection")
+	}
+	if _, ok := f.hub.OpponentDeadline(gameID, alice.Key); !ok {
+		t.Fatal("a game the projection already showed got no timer")
 	}
 }
 
@@ -486,23 +558,20 @@ func TestDisconnectWithoutActiveGameDoesNothing(t *testing.T) {
 }
 
 func TestQueueLeaverDuringMatchGetsTimer(t *testing.T) {
-	// The first player disconnects while the game is being written, when no
-	// projection can show it yet, so only JoinQueue can start their timer.
+	// The first player disconnects as the game is written. Disconnect looks too
+	// early to see it (a no-op catchUp stands in for that), so only JoinQueue
+	// can start their timer.
 	f := newHubFixture(t, shortTimeout)
 	ctx := context.Background()
 	first := f.join(alice)[0]
+	f.hub.catchUp = func(context.Context) error { return nil }
 	var once sync.Once
 	f.commands.onAppended = func() {
 		once.Do(func() { f.hub.Disconnect(ctx, first) })
 	}
 
 	f.join(bob)
-
-	var gameID string
-	if err := f.db.QueryRow(`SELECT game_id FROM events LIMIT 1`).Scan(&gameID); err != nil {
-		t.Fatal(err)
-	}
-	f.waitForResignation(gameID, "black")
+	f.waitForResignation(f.onlyGameID(), "black")
 }
 
 // restart makes a new Hub over the same database, as a server restart would,
@@ -514,7 +583,7 @@ func restart(t *testing.T, f *hubFixture, gameID string) *Hub {
 		t.Fatal(err)
 	}
 	f.catchUp()
-	h := NewHub(f.db, f.commands, shortTimeout)
+	h := NewHub(f.db, f.commands, shortTimeout, f.projector.CatchUp)
 	stopTimersAtCleanup(t, h)
 	if err := h.RestoreTimers(ctx); err != nil {
 		t.Fatal(err)
