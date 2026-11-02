@@ -51,19 +51,9 @@ func (a *GameAggregate) Apply(e Event) error {
 		}
 		a.White, a.Black = d.White, d.Black
 	case EventMoveMade:
-		var d MoveMadeData
-		if err := json.Unmarshal(e.Data, &d); err != nil {
+		if err := ApplyMoveEvent(a.Game, e); err != nil {
 			return err
 		}
-		from, err := ParsePosition(d.From)
-		if err != nil {
-			return err
-		}
-		to, err := ParsePosition(d.To)
-		if err != nil {
-			return err
-		}
-		a.Game.ApplyMove(from, to)
 	case EventGameEnded:
 		a.Ended = true
 	default:

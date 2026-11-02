@@ -49,3 +49,22 @@ type GameEndedData struct {
 	Outcome string `json:"outcome"`
 	Winner  string `json:"winner,omitempty"` // "white" or "black"; empty for stalemate
 }
+
+// ApplyMoveEvent plays a MoveMade event on a game. The aggregate, the
+// projections, and replay all use it. It never checks the rules.
+func ApplyMoveEvent(g *Game, e Event) error {
+	var d MoveMadeData
+	if err := json.Unmarshal(e.Data, &d); err != nil {
+		return err
+	}
+	from, err := ParsePosition(d.From)
+	if err != nil {
+		return err
+	}
+	to, err := ParsePosition(d.To)
+	if err != nil {
+		return err
+	}
+	g.ApplyMove(from, to)
+	return nil
+}

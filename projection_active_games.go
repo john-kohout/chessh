@@ -73,18 +73,6 @@ func (ActiveGames) Apply(tx *sql.Tx, e Event) error {
 		return err
 
 	case EventMoveMade:
-		var d MoveMadeData
-		if err := json.Unmarshal(e.Data, &d); err != nil {
-			return err
-		}
-		from, err := ParsePosition(d.From)
-		if err != nil {
-			return err
-		}
-		to, err := ParsePosition(d.To)
-		if err != nil {
-			return err
-		}
 		var state string
 		if err := tx.QueryRow(`SELECT state FROM active_games WHERE game_id = ?`, e.GameID).Scan(&state); err != nil {
 			return fmt.Errorf("move for game %s: %w", e.GameID, err)
@@ -93,7 +81,9 @@ func (ActiveGames) Apply(tx *sql.Tx, e Event) error {
 		if err := json.Unmarshal([]byte(state), &game); err != nil {
 			return err
 		}
-		game.ApplyMove(from, to)
+		if err := ApplyMoveEvent(&game, e); err != nil {
+			return err
+		}
 		newState, moves, err := encodeGame(&game)
 		if err != nil {
 			return err
