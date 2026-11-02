@@ -1,4 +1,4 @@
-module github.com/imjasonh/chessh
+module github.com/john-kohout/chessh
 
 go 1.25.1
 
