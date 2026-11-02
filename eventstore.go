@@ -32,10 +32,12 @@ func OpenDB(path string) (*sql.DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_txlock=immediate")
 	if err != nil {
 		return nil, err
 	}
+	// _txlock=immediate: a transaction takes the write lock when it begins, so an
+	// outside writer cannot land between our read and our write.
 	db.SetMaxOpenConns(1)
 	if _, err := db.Exec(createEvents); err != nil {
 		db.Close()
@@ -104,7 +106,7 @@ func scanEvents(rows *sql.Rows) ([]Event, error) {
 			return nil, err
 		}
 		e.Data = []byte(data)
-		t, err := time.Parse(time.RFC3339Nano, createdAt)
+		t, err := parseTimestamp(createdAt)
 		if err != nil {
 			return nil, err
 		}
@@ -112,4 +114,14 @@ func scanEvents(rows *sql.Rows) ([]Event, error) {
 		events = append(events, e)
 	}
 	return events, rows.Err()
+}
+
+// parseTimestamp reads our own RFC 3339 timestamps, and also the
+// "2006-01-02 15:04:05" (UTC) that SQLite's datetime('now') writes when
+// someone inserts a row from the sqlite3 shell.
+func parseTimestamp(s string) (time.Time, error) {
+	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return t, nil
+	}
+	return time.Parse("2006-01-02 15:04:05", s)
 }

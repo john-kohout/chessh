@@ -172,3 +172,65 @@ func TestOpenDBCreatesParentDirectories(t *testing.T) {
 		t.Fatalf("got %d rows, want 0", n)
 	}
 }
+
+func TestTransactionHoldsWriteLockFromTheStart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	db, err := OpenDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store := NewEventStore(db)
+	ctx := context.Background()
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := store.After(ctx, tx, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// An outside writer (like the sqlite3 shell) must not slip in between
+	// our read and our write.
+	other, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(100)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	_, err = other.Exec(`INSERT INTO events (game_id, version, type, data, created_at) VALUES ('x', 1, 'GameStarted', '{}', 'now')`)
+	if err == nil {
+		t.Fatal("outside write committed while our transaction was open")
+	}
+
+	if _, err := tx.Exec(`INSERT INTO events (game_id, version, type, data, created_at) VALUES ('g1', 1, 'GameStarted', '{}', '2026-11-02T00:00:00Z')`); err != nil {
+		t.Fatalf("write after read in the same transaction failed: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExternallyInsertedRowWithSQLiteTimestampIsReadable(t *testing.T) {
+	db := testDB(t)
+	store := NewEventStore(db)
+	ctx := context.Background()
+	if _, err := db.Exec(`INSERT INTO events (game_id, version, type, data, created_at) VALUES ('g1', 1, 'GameStarted', '{}', datetime('now'))`); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := store.Load(ctx, "g1")
+	if err != nil || len(loaded) != 1 || loaded[0].CreatedAt.IsZero() {
+		t.Fatalf("Load: %+v, %v", loaded, err)
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	after, err := store.After(ctx, tx, 0)
+	if err != nil || len(after) != 1 || after[0].CreatedAt.IsZero() {
+		t.Fatalf("After: %+v, %v", after, err)
+	}
+}
