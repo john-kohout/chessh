@@ -83,6 +83,15 @@ func (s *EventStore) Load(ctx context.Context, gameID string) ([]Event, error) {
 	return scanEvents(rows)
 }
 
+// LoadInTx is Load inside the caller's transaction, for projections.
+func LoadInTx(ctx context.Context, tx *sql.Tx, gameID string) ([]Event, error) {
+	rows, err := tx.QueryContext(ctx, eventColumns+` WHERE game_id = ? ORDER BY version`, gameID)
+	if err != nil {
+		return nil, err
+	}
+	return scanEvents(rows)
+}
+
 // After returns every game's events with a sequence greater than the given one,
 // in sequence order, reading inside the caller's transaction.
 func (s *EventStore) After(ctx context.Context, tx *sql.Tx, sequence int64) ([]Event, error) {
