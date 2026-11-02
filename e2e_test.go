@@ -293,6 +293,21 @@ func TestE2EFullGameListedAndReplayed(t *testing.T) {
 	black.move("d8h4")
 	white.wait("Black wins")
 	black.wait("Black wins")
+
+	// Back at the menu, the finished game is in My games and can be replayed.
+	menusShown := func() int { return strings.Count(black.output.String(), "Up and down choose, Enter selects") }
+	menus := menusShown() // the one from before the game
+	black.send("x")
+	waitFor(t, "the menu after game over", func() bool { return menusShown() > menus })
+	black.send("\x1b[B")
+	black.wait("> My games")
+	black.send("\r")
+	black.wait("Enter replays")
+	black.send("\r")
+	black.wait("Move 0 of 4")
+	black.send("\x1b[C\x1b[C\x1b[C\x1b[C")
+	black.wait("Move 4 of 4")
+	black.wait("d8-h4")
 }
 
 func TestE2EKeylessClientGetsMessage(t *testing.T) {

@@ -20,6 +20,8 @@ const (
 	screenQueue
 	screenPlaying
 	screenGameOver
+	screenMyGames
+	screenReplay
 )
 
 var menuItems = []string{"Play", "My games"}
@@ -48,6 +50,14 @@ type model struct {
 	selected  *Position
 
 	result *Replay // what screenGameOver shows
+
+	height     int // terminal rows, from tea.WindowSizeMsg; 0 until known
+	myGames    []MyGame
+	gamesReady bool // false while the my_games projection is rebuilding
+	gamesIndex int
+	replay     *Replay // nil while its events load
+	replayGame MyGame
+	step       int // how many moves of the replay are on the board
 }
 
 func newModel(ctx context.Context, app *App, s *Session) model {
@@ -62,6 +72,16 @@ type (
 	joinedMsg   struct{ err error }
 	movedMsg    struct{ err error }
 	gameOverMsg struct {
+		replay Replay
+		err    error
+	}
+	myGamesMsg struct {
+		read  int
+		games []MyGame
+		err   error
+	}
+	replayMsg struct {
+		gameID string
 		replay Replay
 		err    error
 	}
@@ -122,9 +142,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 
+	case tea.WindowSizeMsg:
+		m.height = msg.Height
+		return m, nil
+
 	case updateMsg:
-		if m.screen == screenGameOver {
+		if m.screen == screenGameOver || m.screen == screenReplay { // replay reads events, not projections
 			return m, m.waitForUpdate()
+		}
+		if m.screen == screenMyGames {
+			m.reads++
+			return m, tea.Batch(m.myGamesCmd(), m.waitForUpdate())
 		}
 		m, read := m.read()
 		return m, tea.Batch(read, m.waitForUpdate())
@@ -137,6 +165,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m.route(msg)
+
+	case myGamesMsg:
+		if msg.read != m.reads || m.screen != screenMyGames {
+			return m, nil
+		}
+		return m.showMyGames(msg), nil
+
+	case replayMsg:
+		if m.screen != screenReplay || m.replay != nil || msg.gameID != m.replayGame.GameID {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.message = msg.err.Error()
+			return m, nil
+		}
+		m.replay, m.step = &msg.replay, 0
+		return m, nil
 
 	case joinedMsg:
 		return m.handleJoined(msg)
@@ -234,6 +279,10 @@ func (m model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case screenPlaying:
 		return m.handleBoardKey(key)
+	case screenMyGames:
+		return m.handleMyGamesKey(key)
+	case screenReplay:
+		return m.handleReplayKey(key)
 	}
 	return m, nil
 }
@@ -249,8 +298,88 @@ func (m model) handleMenuKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.screen, m.queued = screenQueue, true
 			return m, m.joinQueue()
 		}
+		m.screen, m.gamesReady = screenMyGames, false
+		m.reads++ // an older read must not route us back to the menu
+		return m, m.myGamesCmd()
 	}
 	return m, nil
+}
+
+func (m model) handleMyGamesKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch key.String() {
+	case "up", "k":
+		m.gamesIndex = max(m.gamesIndex-1, 0)
+	case "down", "j":
+		m.gamesIndex = max(min(m.gamesIndex+1, len(m.myGames)-1), 0)
+	case "esc":
+		m.screen = screenMenu
+		return m.read() // a game may have started meanwhile
+	case "enter":
+		if m.gamesReady && m.gamesIndex < len(m.myGames) {
+			m.replayGame, m.replay, m.step = m.myGames[m.gamesIndex], nil, 0
+			m.screen = screenReplay
+			return m, m.loadReplay(m.replayGame.GameID)
+		}
+	}
+	return m, nil
+}
+
+func (m model) handleReplayKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch key.String() {
+	case "left", "h":
+		m.step = max(m.step-1, 0)
+	case "right", "l":
+		if m.replay != nil {
+			m.step = min(m.step+1, len(m.replay.Moves))
+		}
+	case "esc":
+		m.screen, m.replay = screenMyGames, nil
+		m.reads++
+		return m, m.myGamesCmd()
+	}
+	return m, nil
+}
+
+func (m model) myGamesCmd() tea.Cmd {
+	read := m.reads
+	return func() tea.Msg {
+		games, err := ListMyGames(m.ctx, m.app.DB, m.session.Player.Key)
+		return myGamesMsg{read, games, err}
+	}
+}
+
+// showMyGames keeps the same game selected when the list changes under it.
+func (m model) showMyGames(msg myGamesMsg) model {
+	switch {
+	case errors.Is(msg.err, ErrProjectionUnavailable):
+		m.gamesReady = false // shows Loading; the update after the rebuild brings the list back
+	case msg.err != nil:
+		m.message = msg.err.Error()
+	default:
+		selected := ""
+		if m.gamesIndex < len(m.myGames) {
+			selected = m.myGames[m.gamesIndex].GameID
+		}
+		m.myGames, m.gamesReady = msg.games, true
+		if i := slices.IndexFunc(m.myGames, func(g MyGame) bool { return g.GameID == selected }); i >= 0 {
+			m.gamesIndex = i
+		}
+		m.gamesIndex = max(min(m.gamesIndex, len(m.myGames)-1), 0)
+	}
+	return m
+}
+
+// loadReplay reads the game's events, not a projection, so a replay keeps
+// working while projections rebuild.
+func (m model) loadReplay(gameID string) tea.Cmd {
+	return func() tea.Msg {
+		events, err := m.app.Store.Load(m.ctx, gameID)
+		if err != nil {
+			return replayMsg{gameID: gameID, err: err}
+		}
+		replay, err := BuildReplay(events)
+		return replayMsg{gameID, replay, err}
+	}
 }
 
 func (m model) handleBoardKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -344,6 +473,10 @@ func (m model) View() string {
 		m.viewPlaying(&s)
 	case screenGameOver:
 		m.viewGameOver(&s)
+	case screenMyGames:
+		m.viewMyGames(&s)
+	case screenReplay:
+		m.viewReplay(&s)
 	}
 	if m.message != "" {
 		s.WriteString("\n" + m.message + "\n")
@@ -410,6 +543,96 @@ func (m model) viewGameOver(s *strings.Builder) {
 		s.WriteString(line + "\n")
 	}
 	s.WriteString("\nPress any key for the menu\n")
+}
+
+func (m model) viewMyGames(s *strings.Builder) {
+	switch {
+	case !m.gamesReady:
+		s.WriteString("Loading...\n")
+		return
+	case len(m.myGames) == 0:
+		s.WriteString("No games yet. Esc goes back, q quits\n")
+		return
+	}
+	fmt.Fprintf(s, "  %-6s  %-8s  %-5s  %-8s%s\n", "Date", "Opponent", "You", "Result", "Moves")
+	// The title takes 2 lines, the header 1, the help 2, and a message 2.
+	rows := max(m.windowHeight()-7, 1)
+	start := max(min(m.gamesIndex-rows/2, len(m.myGames)-rows), 0)
+	for i := start; i < min(start+rows, len(m.myGames)); i++ {
+		g := m.myGames[i]
+		pointer := "  "
+		if i == m.gamesIndex {
+			pointer = "> "
+		}
+		fmt.Fprintf(s, "%s%-6s  %-8.8s  %-5s  %-10s%3d\n",
+			pointer, g.EndedAt.Local().Format("Jan 2"), g.OpponentName, capitalize(g.Color), g.ResultLabel(), g.MoveCount)
+	}
+	s.WriteString("\nUp and down choose, Enter replays, Esc goes back, q quits\n")
+}
+
+func capitalize(s string) string { return strings.ToUpper(s[:1]) + s[1:] }
+
+func (m model) windowHeight() int {
+	if m.height == 0 {
+		return 24
+	}
+	return m.height
+}
+
+func (m model) viewReplay(s *strings.Builder) {
+	if m.replay == nil {
+		s.WriteString("Loading...\n")
+		return
+	}
+	boardLines := getBoardLines(m.replay.Positions[m.step], boardMarks{})
+	panel := m.replayPanel()
+	for i := range max(len(boardLines), len(panel)) {
+		if i < len(boardLines) {
+			s.WriteString(boardLines[i] + "   ")
+		} else {
+			s.WriteString(strings.Repeat(" ", 29)) // the board's width plus the gap
+		}
+		if i < len(panel) {
+			s.WriteString(panel[i])
+		}
+		s.WriteString("\n")
+	}
+}
+
+// replayPanel is the text beside the board: who played, the moves around the
+// current one, and the keys.
+func (m model) replayPanel() []string {
+	g := m.replayGame
+	outcome := map[string]string{"won": "You won", "lost": "You lost", "draw": "Draw"}[g.Result]
+	lines := []string{
+		"you vs " + g.OpponentName,
+		g.EndedAt.Local().Format("Jan 2") + " - " + outcome,
+		"",
+	}
+
+	// Moves are listed in pairs, a window of them so long games still fit.
+	moves := m.replay.Moves
+	pairs := (len(moves) + 1) / 2
+	rows := max(min(6, m.windowHeight()-11), 1)
+	current := max(m.step-1, 0) / 2
+	start := max(min(current-rows/2, pairs-rows), 0)
+	for p := start; p < min(start+rows, pairs); p++ {
+		line := fmt.Sprintf("%d. %s", p+1, m.moveText(2*p))
+		if 2*p+1 < len(moves) {
+			line += "  " + m.moveText(2*p+1)
+		}
+		lines = append(lines, line)
+	}
+	return append(lines, "", fmt.Sprintf("Move %d of %d", m.step, len(moves)), "",
+		"left/right  step", "esc         back")
+}
+
+// moveText is one move, highlighted if it is the one just played.
+func (m model) moveText(i int) string {
+	if i == m.step-1 {
+		return "\033[7m" + m.replay.Moves[i] + "\033[0m"
+	}
+	return m.replay.Moves[i]
 }
 
 func resultLine(r Replay, playerKey string) string {

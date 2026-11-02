@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"regexp"
 	"slices"
 	"strings"
@@ -576,4 +577,264 @@ func TestReplacedSessionQuits(t *testing.T) {
 		d.pump(time.Millisecond)
 		return d.quit
 	})
+}
+
+// finishGame plays fool's mate for a game: bob (Black) beats alice in 4 moves.
+func finishGame(t *testing.T, app *App, gameID string) {
+	t.Helper()
+	if err := app.Commands.StartGame(context.Background(), gameID, alice, bob); err != nil {
+		t.Fatal(err)
+	}
+	playOnStore(t, app, gameID, "f2f3", "e7e5", "g2g4", "d8h4")
+}
+
+// bobWithFinishedGame is bob on the menu, after beating alice.
+func bobWithFinishedGame(t *testing.T) (*App, *uiDriver) {
+	t.Helper()
+	app := newUIApp(t, longTimeout)
+	finishGame(t, app, "g1")
+	if err := app.Projector.CatchUp(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	d := newUIDriver(t, app, bob)
+	d.waitView("My games")
+	return app, d
+}
+
+func openMyGames(d *uiDriver) {
+	d.t.Helper()
+	d.press(runeKey("j"), enterKey)
+	d.waitView("Opponent")
+}
+
+var rightKey, leftKey = tea.KeyMsg{Type: tea.KeyRight}, tea.KeyMsg{Type: tea.KeyLeft}
+
+func TestMyGamesListShowsGame(t *testing.T) {
+	_, d := bobWithFinishedGame(t)
+	openMyGames(d)
+	view := d.m.View()
+	for _, want := range []string{"alice", "Black", "Won", "Date", "Moves"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("no %q in:\n%s", want, view)
+		}
+	}
+	if !regexp.MustCompile(`Won\s+4\n`).MatchString(view) {
+		t.Fatalf("no move count 4 after Won:\n%s", view)
+	}
+	if !strings.Contains(view, d.m.myGames[0].EndedAt.Local().Format("Jan 2")) {
+		t.Fatalf("no date in:\n%s", view)
+	}
+}
+
+func TestMyGamesEmptyState(t *testing.T) {
+	d := newUIDriver(t, newUIApp(t, longTimeout), alice)
+	d.waitView("My games")
+	d.press(runeKey("j"), enterKey)
+	d.waitView("No games yet")
+	d.press(enterKey, rightKey, tea.KeyMsg{Type: tea.KeyDown}, tea.KeyMsg{Type: tea.KeyUp}) // nothing to open
+	if !strings.Contains(d.m.View(), "No games yet") {
+		t.Fatalf("left the empty list:\n%s", d.m.View())
+	}
+}
+
+func TestMyGamesEscReturnsToMenu(t *testing.T) {
+	_, d := bobWithFinishedGame(t)
+	openMyGames(d)
+	d.press(escKey)
+	d.waitView("> My games")
+	if strings.Contains(d.m.View(), "Opponent") {
+		t.Fatalf("still on the list:\n%s", d.m.View())
+	}
+}
+
+func TestMyGamesQuitKeys(t *testing.T) {
+	for _, key := range []tea.KeyMsg{runeKey("q"), {Type: tea.KeyCtrlC}} {
+		_, d := bobWithFinishedGame(t)
+		openMyGames(d)
+		d.press(key)
+		d.pump(10 * time.Millisecond)
+		if !d.quit {
+			t.Fatalf("%v did not quit the list", key)
+		}
+		d.quit = false
+		d.press(enterKey)
+		d.waitView("Move 0 of 4")
+		d.press(key)
+		d.pump(10 * time.Millisecond)
+		if !d.quit {
+			t.Fatalf("%v did not quit the replay", key)
+		}
+	}
+}
+
+func TestMyGamesSelectionStaysInRange(t *testing.T) {
+	_, d := bobWithFinishedGame(t)
+	openMyGames(d)
+	up, down := tea.KeyMsg{Type: tea.KeyUp}, tea.KeyMsg{Type: tea.KeyDown}
+	d.press(up, up, down, down, down)
+	if d.m.gamesIndex != 0 {
+		t.Fatalf("index = %d, want 0 with one game", d.m.gamesIndex)
+	}
+	if !strings.Contains(d.m.View(), "alice") {
+		t.Fatalf("list lost its row:\n%s", d.m.View())
+	}
+}
+
+func TestMyGamesManyGamesScroll(t *testing.T) {
+	app := newUIApp(t, longTimeout)
+	for i := range 50 {
+		finishGame(t, app, fmt.Sprintf("g%02d", i))
+	}
+	if err := app.Projector.CatchUp(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	d := newUIDriver(t, app, bob)
+	d.waitView("My games")
+	d.handle(tea.WindowSizeMsg{Width: 80, Height: 24})
+	openMyGames(d)
+
+	check := func(index int) {
+		t.Helper()
+		view := d.m.View()
+		if lines := strings.Count(view, "\n"); lines > 24 {
+			t.Fatalf("view has %d lines:\n%s", lines, view)
+		}
+		selected := 0
+		for _, line := range strings.Split(view, "\n") {
+			if strings.HasPrefix(line, "> ") {
+				selected++
+			}
+		}
+		if selected != 1 || d.m.gamesIndex != index {
+			t.Fatalf("selected rows = %d, index = %d, want %d:\n%s", selected, d.m.gamesIndex, index, view)
+		}
+	}
+	check(0)
+	for range 49 {
+		d.press(tea.KeyMsg{Type: tea.KeyDown})
+	}
+	check(49)
+	for range 30 {
+		d.press(tea.KeyMsg{Type: tea.KeyUp})
+	}
+	check(19)
+}
+
+func TestMyGamesRefreshesAfterProjectionDrop(t *testing.T) {
+	app, d := bobWithFinishedGame(t)
+	openMyGames(d)
+	before := d.m.View()
+
+	if _, err := app.DB.Exec(`DROP TABLE my_games`); err != nil {
+		t.Fatal(err)
+	}
+	app.Hub.Broadcast()
+	d.waitView("Loading")
+	d.press(enterKey, tea.KeyMsg{Type: tea.KeyDown}) // safe with no rows
+
+	if err := app.Projector.CatchUp(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	d.waitView("Opponent")
+	if d.m.View() != before {
+		t.Fatalf("list changed:\n%s\nwas:\n%s", d.m.View(), before)
+	}
+}
+
+func openReplay(t *testing.T) (*App, *uiDriver) {
+	app, d := bobWithFinishedGame(t)
+	openMyGames(d)
+	d.press(enterKey)
+	d.waitView("Move 0 of 4")
+	return app, d
+}
+
+func TestReplayStartsAtStartingPosition(t *testing.T) {
+	_, d := openReplay(t)
+	view := d.m.View()
+	if pieceOn(t, view, "f2") != "♙" || pieceOn(t, view, "d8") != "♛" {
+		t.Fatalf("not the starting position:\n%s", view)
+	}
+	for _, want := range []string{"you vs alice", "You won", "left/right", "esc"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("no %q in:\n%s", want, view)
+		}
+	}
+}
+
+func TestReplayStepsForwardAndBack(t *testing.T) {
+	_, d := openReplay(t)
+	d.press(rightKey)
+	view := d.m.View()
+	if !strings.Contains(view, "Move 1 of 4") || pieceOn(t, view, "f3") != "♙" || pieceOn(t, view, "f2") != "" {
+		t.Fatalf("after right:\n%s", view)
+	}
+	if !strings.Contains(ansiCode.ReplaceAllString(view, ""), "1. f2-f3") {
+		t.Fatalf("no move list:\n%s", view)
+	}
+	d.press(leftKey)
+	view = d.m.View()
+	if !strings.Contains(view, "Move 0 of 4") || pieceOn(t, view, "f2") != "♙" {
+		t.Fatalf("after left:\n%s", view)
+	}
+}
+
+func TestReplayStopsAtEnds(t *testing.T) {
+	_, d := openReplay(t)
+	d.press(leftKey, leftKey)
+	d.waitView("Move 0 of 4")
+	d.press(rightKey, rightKey, rightKey, rightKey, rightKey, rightKey)
+	view := d.m.View()
+	if !strings.Contains(view, "Move 4 of 4") || pieceOn(t, view, "h4") != "♛" {
+		t.Fatalf("at the end:\n%s", view)
+	}
+	if !strings.Contains(ansiCode.ReplaceAllString(view, ""), "d8-h4") {
+		t.Fatalf("no d8-h4 in:\n%s", view)
+	}
+}
+
+func TestReplayEscReturnsToList(t *testing.T) {
+	_, d := openReplay(t)
+	d.press(escKey)
+	d.waitView("Opponent")
+	if d.m.gamesIndex != 0 || !strings.Contains(d.m.View(), "> ") {
+		t.Fatalf("no selected row:\n%s", d.m.View())
+	}
+}
+
+func TestReplayUnaffectedByProjectionDrop(t *testing.T) {
+	app, d := openReplay(t)
+	d.press(rightKey)
+	for _, table := range []string{"my_games", "active_games"} {
+		if _, err := app.DB.Exec(`DROP TABLE ` + table); err != nil {
+			t.Fatal(err)
+		}
+	}
+	app.Hub.Broadcast()
+	d.pump(100 * time.Millisecond)
+	d.press(rightKey)
+	view := d.m.View()
+	if !strings.Contains(view, "Move 2 of 4") || strings.Contains(view, "Loading") {
+		t.Fatalf("replay disturbed:\n%s", view)
+	}
+}
+
+func TestReplayMoveListStaysInWindow(t *testing.T) {
+	var shuffle []string
+	for range 20 {
+		shuffle = append(shuffle, "g1f3", "g8f6", "f3g1", "f6g8")
+	}
+	r, err := BuildReplay(gameEvents(t, "g1", alice, bob, shuffle...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := model{screen: screenReplay, replay: &r, replayGame: MyGame{OpponentName: "bob", Result: "won"}, step: 41, height: 24}
+	view := m.View()
+	if lines := strings.Count(view, "\n"); lines > 24 {
+		t.Fatalf("view has %d lines:\n%s", lines, view)
+	}
+	plain := ansiCode.ReplaceAllString(view, "")
+	if !strings.Contains(plain, "21. ") || strings.Contains(plain, "\n1. ") || !strings.Contains(plain, "Move 41 of 80") {
+		t.Fatalf("window not around move 41:\n%s", plain)
+	}
 }
