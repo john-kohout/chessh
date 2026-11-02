@@ -1,6 +1,9 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 type Color int
 
@@ -196,7 +199,7 @@ func (g *Game) isValidPieceMove(piece Piece, from, to Position) bool {
 	case Queen:
 		return g.isValidQueenMove(from, to, dx, dy)
 	case King:
-		return g.isValidKingMove(piece, dx, dy)
+		return g.isValidKingMove(piece, from, dx, dy)
 	}
 	return false
 }
@@ -213,7 +216,8 @@ func (g *Game) isValidPawnMove(piece Piece, from, to Position, dx, dy int) bool 
 		if dy == direction {
 			return true
 		}
-		if from.Row == startRow && dy == 2*direction {
+		between := Position{from.Row + direction, from.Col}
+		if from.Row == startRow && dy == 2*direction && g.Board.At(between).Type == Empty {
 			return true
 		}
 	}
@@ -254,12 +258,12 @@ func (g *Game) isValidQueenMove(from, to Position, dx, dy int) bool {
 	return g.isValidRookMove(from, to, dx, dy) || g.isValidBishopMove(from, to, dx, dy)
 }
 
-func (g *Game) isValidKingMove(piece Piece, dx, dy int) bool {
+func (g *Game) isValidKingMove(piece Piece, from Position, dx, dy int) bool {
 	if abs(dx) <= 1 && abs(dy) <= 1 {
 		return true
 	}
 
-	if abs(dx) == 2 && dy == 0 && !g.KingMoved[piece.Color] {
+	if abs(dx) == 2 && dy == 0 && from.Col == 4 && !g.KingMoved[piece.Color] {
 		return g.canCastle(piece.Color, dx > 0)
 	}
 
@@ -271,12 +275,17 @@ func (g *Game) canCastle(color Color, kingSide bool) bool {
 	if color == Black {
 		row = 7
 	}
+	if from := (Position{row, 4}); g.Board.At(from) != (Piece{King, color}) {
+		return false
+	}
 
 	rookCol := 0
 	if kingSide {
 		rookCol = 7
 	}
-
+	if g.Board.At(Position{row, rookCol}) != (Piece{Rook, color}) {
+		return false
+	}
 	if g.RookMoved[color][rookCol/7] {
 		return false
 	}
@@ -285,23 +294,24 @@ func (g *Game) canCastle(color Color, kingSide bool) bool {
 		return false
 	}
 
-	start, end := 1, 3
+	// Squares that must be empty, and squares the king crosses (which must be safe).
+	emptyFrom, emptyTo := 1, 3
+	crossed := []int{3, 2}
 	if kingSide {
-		start, end = 5, 6
+		emptyFrom, emptyTo = 5, 6
+		crossed = []int{5, 6}
 	}
 
-	for col := start; col <= end; col++ {
+	for col := emptyFrom; col <= emptyTo; col++ {
 		if g.Board.At(Position{row, col}).Type != Empty {
 			return false
 		}
+	}
 
-		g.Board.Set(Position{row, 4}, Piece{Empty, White})
-		g.Board.Set(Position{row, col}, Piece{King, color})
-		inCheck := g.IsInCheck(color)
-		g.Board.Set(Position{row, 4}, Piece{King, color})
-		g.Board.Set(Position{row, col}, Piece{Empty, White})
-
-		if inCheck {
+	for _, col := range crossed {
+		test := g.clone()
+		test.Board.Move(Position{row, 4}, Position{row, col})
+		if test.IsInCheck(color) {
 			return false
 		}
 	}
@@ -326,33 +336,76 @@ func (g *Game) isPathClear(from, to Position) bool {
 	return true
 }
 
-func (g *Game) MakeMove(from, to Position) bool {
+// clone copies everything the rules need. MoveHistory is not copied.
+func (g *Game) clone() *Game {
+	c := *g
+	c.MoveHistory = nil
+	if g.EnPassantTarget != nil {
+		target := *g.EnPassantTarget
+		c.EnPassantTarget = &target
+	}
+	return &c
+}
+
+// IsLegalMove is IsValidMove plus: the mover must not be left in check.
+func (g *Game) IsLegalMove(from, to Position) bool {
 	if !g.IsValidMove(from, to) {
 		return false
 	}
 
+	test := g.clone()
+	test.executeMove(from, to, g.Board.At(from))
+	return !test.IsInCheck(g.CurrentTurn)
+}
+
+// IsPromotion reports whether the move takes a pawn to the last rank.
+func (g *Game) IsPromotion(from, to Position) bool {
 	piece := g.Board.At(from)
-	move := Move{from, to, piece}
-	originalTarget := g.Board.At(to)
-
-	g.executeMove(from, to, piece)
-
-	if g.IsInCheck(g.CurrentTurn) {
-		g.undoMove(from, to, piece, originalTarget)
+	if piece.Type != Pawn || !to.Valid() {
 		return false
 	}
+	lastRow := 7
+	if piece.Color == Black {
+		lastRow = 0
+	}
+	return to.Row == lastRow
+}
 
+// ApplyMove changes the state unconditionally. It never checks the rules.
+func (g *Game) ApplyMove(from, to Position) {
+	piece := g.Board.At(from)
+	promotion := g.IsPromotion(from, to)
+
+	g.updateRookRights(to)
+	g.executeMove(from, to, piece)
+	if promotion {
+		g.Board.Set(to, Piece{Queen, piece.Color})
+	}
 	g.updateGameState(from, to, piece)
-	g.MoveHistory = append(g.MoveHistory, move)
+	g.MoveHistory = append(g.MoveHistory, Move{from, to, piece})
 	g.CurrentTurn = 1 - g.CurrentTurn
+}
 
+func (g *Game) MakeMove(from, to Position) bool {
+	if !g.IsLegalMove(from, to) {
+		return false
+	}
+	g.ApplyMove(from, to)
 	return true
+}
+
+// updateRookRights records a rook captured on its corner, before it is gone.
+func (g *Game) updateRookRights(to Position) {
+	captured := g.Board.At(to)
+	if captured.Type == Rook && (to.Col == 0 || to.Col == 7) {
+		g.RookMoved[captured.Color][to.Col/7] = true
+	}
 }
 
 func (g *Game) executeMove(from, to Position, piece Piece) {
 	if piece.Type == King && abs(to.Col-from.Col) == 2 {
 		g.executeCastle(from, to)
-	} else if piece.Type == Pawn && g.EnPassantTarget != nil && *g.EnPassantTarget == to {
+	} else if piece.Type == Pawn && abs(to.Col-from.Col) == 1 && g.EnPassantTarget != nil && *g.EnPassantTarget == to {
 		g.executeEnPassant(from, to)
 	} else {
 		g.Board.Move(from, to)
@@ -378,42 +431,6 @@ func (g *Game) executeEnPassant(from, to Position) {
 	g.Board.Move(from, to)
 	capturedPawnRow := from.Row
 	g.Board.Set(Position{capturedPawnRow, to.Col}, Piece{Empty, White})
-}
-
-func (g *Game) undoMove(from, to Position, piece Piece, originalTarget Piece) {
-	if piece.Type == King && abs(to.Col-from.Col) == 2 {
-		g.undoCastle(from, to, piece.Color)
-	} else if piece.Type == Pawn && g.EnPassantTarget != nil && *g.EnPassantTarget == to {
-		g.undoEnPassant(from, to)
-	} else {
-		g.Board.Set(from, piece)
-		g.Board.Set(to, originalTarget)
-	}
-}
-
-func (g *Game) undoCastle(from, to Position, color Color) {
-	g.Board.Set(from, Piece{King, color})
-	g.Board.Set(to, Piece{Empty, White})
-
-	rookFromCol := 0
-	rookToCol := 3
-	if to.Col > from.Col {
-		rookFromCol = 7
-		rookToCol = 5
-	}
-
-	rookFrom := Position{from.Row, rookFromCol}
-	rookTo := Position{from.Row, rookToCol}
-	g.Board.Set(rookFrom, Piece{Rook, color})
-	g.Board.Set(rookTo, Piece{Empty, White})
-}
-
-func (g *Game) undoEnPassant(from, to Position) {
-	g.Board.Set(from, Piece{Pawn, g.CurrentTurn})
-	g.Board.Set(to, Piece{Empty, White})
-	capturedPawnRow := from.Row
-	enemyColor := 1 - g.CurrentTurn
-	g.Board.Set(Position{capturedPawnRow, to.Col}, Piece{Pawn, enemyColor})
 }
 
 func (g *Game) updateGameState(from, to Position, piece Piece) {
@@ -495,55 +512,41 @@ func (g *Game) canPieceAttack(piece Piece, from, to Position) bool {
 	return false
 }
 
-func (g *Game) IsCheckmate(color Color) bool {
-	if !g.IsInCheck(color) {
-		return false
-	}
-
+// LegalMoves lists every legal move for the player to move.
+func (g *Game) LegalMoves() []Move {
+	var moves []Move
 	for row := range 8 {
 		for col := range 8 {
 			from := Position{row, col}
 			piece := g.Board.At(from)
-			if piece.Type != Empty && piece.Color == color {
-				for toRow := range 8 {
-					for toCol := range 8 {
-						to := Position{toRow, toCol}
-						if g.isValidMoveIgnoringCheck(from, to) {
-							originalPiece := g.Board.At(to)
-							g.Board.Move(from, to)
-							inCheck := g.IsInCheck(color)
-							g.Board.Set(from, piece)
-							g.Board.Set(to, originalPiece)
-
-							if !inCheck {
-								return false
-							}
-						}
+			if piece.Type == Empty || piece.Color != g.CurrentTurn {
+				continue
+			}
+			for toRow := range 8 {
+				for toCol := range 8 {
+					to := Position{toRow, toCol}
+					if g.IsLegalMove(from, to) {
+						moves = append(moves, Move{from, to, piece})
 					}
 				}
 			}
 		}
 	}
-
-	return true
+	return moves
 }
 
-func (g *Game) isValidMoveIgnoringCheck(from, to Position) bool {
-	if !from.Valid() || !to.Valid() {
-		return false
-	}
+func (g *Game) hasNoLegalMoves(color Color) bool {
+	test := g.clone()
+	test.CurrentTurn = color
+	return len(test.LegalMoves()) == 0
+}
 
-	piece := g.Board.At(from)
-	if piece.Type == Empty {
-		return false
-	}
+func (g *Game) IsCheckmate(color Color) bool {
+	return g.IsInCheck(color) && g.hasNoLegalMoves(color)
+}
 
-	target := g.Board.At(to)
-	if target.Type != Empty && target.Color == piece.Color {
-		return false
-	}
-
-	return g.isValidPieceMove(piece, from, to)
+func (g *Game) IsStalemate(color Color) bool {
+	return !g.IsInCheck(color) && g.hasNoLegalMoves(color)
 }
 
 func (g *Game) GameStatus() string {
@@ -560,6 +563,56 @@ func (g *Game) GameStatus() string {
 	}
 
 	return ""
+}
+
+func ParsePosition(s string) (Position, error) {
+	if len(s) != 2 || s[0] < 'a' || s[0] > 'h' || s[1] < '1' || s[1] > '8' {
+		return Position{}, fmt.Errorf("invalid square %q", s)
+	}
+	return Position{Row: int(s[1] - '1'), Col: int(s[0] - 'a')}, nil
+}
+
+// Placement is the piece-placement field of a FEN string, rank 8 first.
+func (b Board) Placement() string {
+	letters := map[PieceType]string{Pawn: "p", Rook: "r", Knight: "n", Bishop: "b", Queen: "q", King: "k"}
+	ranks := make([]string, 0, 8)
+	for row := 7; row >= 0; row-- {
+		var rank strings.Builder
+		empty := 0
+		for col := range 8 {
+			piece := b[row][col]
+			if piece.Type == Empty {
+				empty++
+				continue
+			}
+			if empty > 0 {
+				fmt.Fprint(&rank, empty)
+				empty = 0
+			}
+			letter := letters[piece.Type]
+			if piece.Color == White {
+				letter = strings.ToUpper(letter)
+			}
+			rank.WriteString(letter)
+		}
+		if empty > 0 {
+			fmt.Fprint(&rank, empty)
+		}
+		ranks = append(ranks, rank.String())
+	}
+	return strings.Join(ranks, "/")
+}
+
+func (c Color) Name() string {
+	if c == White {
+		return "white"
+	}
+	return "black"
+}
+
+func (t PieceType) Name() string {
+	names := map[PieceType]string{Pawn: "pawn", Rook: "rook", Knight: "knight", Bishop: "bishop", Queen: "queen", King: "king"}
+	return names[t]
 }
 
 func abs(x int) int {
