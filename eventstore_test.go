@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -232,5 +233,41 @@ func TestExternallyInsertedRowWithSQLiteTimestampIsReadable(t *testing.T) {
 	after, err := store.After(ctx, tx, 0)
 	if err != nil || len(after) != 1 || after[0].CreatedAt.IsZero() {
 		t.Fatalf("After: %+v, %v", after, err)
+	}
+}
+
+func TestOpenDBAcceptsAnyFileName(t *testing.T) {
+	for _, name := range []string{"with space.db", "what?.db", "hash#tag.db", "100%.db", "dir ? #/chessh.db"} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), name)
+			checkOpenDB(t, path, path)
+		})
+	}
+}
+
+func TestOpenDBAcceptsRelativePath(t *testing.T) {
+	t.Chdir(t.TempDir())
+	checkOpenDB(t, "chessh.db", "chessh.db")
+	checkOpenDB(t, "sub dir/what?.db", filepath.Join("sub dir", "what?.db"))
+}
+
+// checkOpenDB opens path and checks that the file landed exactly at wantFile
+// and that the options after the file name still took effect.
+func checkOpenDB(t *testing.T, path, wantFile string) {
+	t.Helper()
+	db, err := OpenDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := os.Stat(wantFile); err != nil {
+		t.Fatalf("no database at the given path: %v", err)
+	}
+	var mode string
+	if err := db.QueryRow(`PRAGMA journal_mode`).Scan(&mode); err != nil {
+		t.Fatal(err)
+	}
+	if mode != "wal" {
+		t.Fatalf("journal_mode = %q, want wal", mode)
 	}
 }

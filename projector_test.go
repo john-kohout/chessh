@@ -10,6 +10,8 @@ import (
 	"time"
 )
 
+var errBoom = errors.New("boom")
+
 // countingProjection adds one row per event. failOn makes Apply fail for that sequence.
 type countingProjection struct {
 	name   string
@@ -25,7 +27,7 @@ func (c *countingProjection) Create(tx *sql.Tx) error {
 
 func (c *countingProjection) Apply(tx *sql.Tx, e Event) error {
 	if e.Sequence == c.failOn.Load() {
-		return errors.New("boom")
+		return errBoom
 	}
 	_, err := tx.Exec(`INSERT INTO `+c.name+` (sequence) VALUES (?)`, e.Sequence)
 	return err
@@ -340,4 +342,27 @@ func TestRunSurvivesBusyDatabase(t *testing.T) {
 		db.QueryRow(`SELECT COUNT(*) FROM counted`).Scan(&n)
 		return n == 3
 	})
+}
+
+// brokenCreate is a projection whose table can't be made.
+type brokenCreate struct{ countingProjection }
+
+func (*brokenCreate) Create(*sql.Tx) error { return errBoom }
+
+func TestCatchUpErrorsNameTheProjectionAndEvent(t *testing.T) {
+	db := testDB(t)
+	store := NewEventStore(db)
+	appendGame(t, store, "g1")
+	proj := &countingProjection{name: "counted"}
+	proj.failOn.Store(2)
+	broken := &brokenCreate{countingProjection{name: "broken"}}
+	err := NewProjector(db, store, nil, proj, broken).CatchUp(context.Background())
+	if !errors.Is(err, errBoom) {
+		t.Fatalf("got %v, want errBoom", err)
+	}
+	for _, want := range []string{"counted at sequence 2: boom", "broken: boom"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("got %q, want it to contain %q", err, want)
+		}
+	}
 }

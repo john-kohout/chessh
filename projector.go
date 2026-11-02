@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -89,54 +90,59 @@ func (p *Projector) CatchUp(ctx context.Context) error {
 // catchUpOne is one transaction: rebuild if the table or checkpoint is
 // missing, apply new events, save the checkpoint. It reports whether anything changed.
 func (p *Projector) catchUpOne(ctx context.Context, projection Projection) (bool, error) {
+	name := projection.Name()
+	fail := func(err error) (bool, error) { return false, fmt.Errorf("%s: %w", name, err) }
+
 	tx, err := p.db.BeginTx(ctx, nil)
 	if err != nil {
-		return false, err
+		return fail(err)
 	}
 	defer tx.Rollback()
 
 	if _, err := tx.ExecContext(ctx, createCheckpoints); err != nil {
-		return false, err
+		return fail(err)
 	}
-	name := projection.Name()
 	changed := false
 
 	var tables int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, name).Scan(&tables); err != nil {
-		return false, err
+		return fail(err)
 	}
 	var checkpoint int64
 	err = tx.QueryRowContext(ctx, `SELECT sequence FROM projection_checkpoints WHERE projection = ?`, name).Scan(&checkpoint)
 	hasCheckpoint := err == nil
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return false, err
+		return fail(err)
 	}
 
 	if tables == 0 || !hasCheckpoint {
 		if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS `+name); err != nil {
-			return false, err
+			return fail(err)
 		}
 		if err := projection.Create(tx); err != nil {
-			return false, err
+			return fail(err)
 		}
 		checkpoint, changed = 0, true
 	}
 
 	events, err := p.store.After(ctx, tx, checkpoint)
 	if err != nil {
-		return false, err
+		return fail(err)
 	}
 	for _, e := range events {
 		if err := projection.Apply(tx, e); err != nil {
-			return false, err
+			return false, fmt.Errorf("%s at sequence %d: %w", name, e.Sequence, err)
 		}
 		checkpoint, changed = e.Sequence, true
 	}
 
 	if changed {
 		if _, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO projection_checkpoints (projection, sequence) VALUES (?, ?)`, name, checkpoint); err != nil {
-			return false, err
+			return fail(err)
 		}
 	}
-	return changed, tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fail(err)
+	}
+	return changed, nil
 }

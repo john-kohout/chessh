@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -32,7 +33,13 @@ func OpenDB(path string) (*sql.DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_txlock=immediate")
+	dsn := url.URL{
+		Scheme:   "file",
+		OmitHost: true, // keeps a relative path relative
+		Path:     path, // String escapes any ?, # or space in it
+		RawQuery: "_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_txlock=immediate",
+	}
+	db, err := sql.Open("sqlite", dsn.String())
 	if err != nil {
 		return nil, err
 	}

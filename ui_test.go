@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"slices"
@@ -837,4 +838,72 @@ func TestReplayMoveListStaysInWindow(t *testing.T) {
 	if !strings.Contains(plain, "21. ") || strings.Contains(plain, "\n1. ") || !strings.Contains(plain, "Move 41 of 80") {
 		t.Fatalf("window not around move 41:\n%s", plain)
 	}
+}
+
+func TestVanishedRowStaysOnBoardAndAcceptsMove(t *testing.T) {
+	app := startedUIApp(t, longTimeout)
+	white, black := startUIGame(t, app)
+	gameID := white.m.gameID
+
+	if _, err := app.DB.Exec(`DELETE FROM active_games`); err != nil {
+		t.Fatal(err)
+	}
+	app.Hub.Broadcast()
+	white.waitView("Game over") // the read found no row, so it asks the events
+	white.waitUntil("the events' answer", func(string) bool {
+		return white.m.result != nil || white.m.screen == screenPlaying
+	})
+
+	view := white.m.View()
+	for _, invented := range []string{"Checkmate", "wins", "Game over"} {
+		if strings.Contains(view, invented) {
+			t.Fatalf("view says %q about an unfinished game:\n%s", invented, view)
+		}
+	}
+	if !strings.Contains(view, "Your turn") || !strings.Contains(view, boardHeader) || white.m.gameID != gameID {
+		t.Fatalf("not back on the board (game %q):\n%s", white.m.gameID, view)
+	}
+
+	white.selectSquare("e2")
+	white.selectSquare("e4")
+	white.waitView("Last move: e2 -> e4")
+	black.waitView("Last move: e2 -> e4")
+	if white.m.message != "" {
+		t.Fatalf("move rejected: %s", white.m.message)
+	}
+}
+
+func TestResultLineNeverInventsAResult(t *testing.T) {
+	got := resultLine(Replay{White: alice, Black: bob}, alice.Key)
+	if strings.Contains(got, "Checkmate") || strings.Contains(got, "wins") {
+		t.Fatalf("resultLine with no outcome = %q", got)
+	}
+}
+
+func TestFailedJoinReturnsToMenu(t *testing.T) {
+	app := newUIApp(t, longTimeout)
+	d := newUIDriver(t, app, alice)
+	d.waitView("My games")
+
+	catchUp := app.Hub.catchUp
+	app.Hub.catchUp = func(context.Context) error { return errors.New("database is busy") }
+	d.press(enterKey)
+	d.waitView("database is busy")
+	if view := d.m.View(); !strings.Contains(view, "My games") || strings.Contains(view, "Waiting") {
+		t.Fatalf("not back at the menu:\n%s", view)
+	}
+	if d.m.queued {
+		t.Fatal("model still thinks it is in line")
+	}
+	if got := hubQueue(app.Hub); len(got) != 0 {
+		t.Fatalf("queue has %d players, want 0", len(got))
+	}
+
+	app.Hub.catchUp = catchUp
+	d.press(enterKey)
+	d.waitView("Waiting")
+	waitFor(t, "alice in the queue", func() bool {
+		d.pump(time.Millisecond)
+		return slices.Contains(hubQueue(app.Hub), d.m.session)
+	})
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -60,21 +61,15 @@ func (ActiveGames) Apply(tx *sql.Tx, e Event) error {
 		if err := json.Unmarshal(e.Data, &d); err != nil {
 			return err
 		}
-		game := NewGame()
-		state, moves, err := encodeGame(game)
-		if err != nil {
-			return err
-		}
-		_, err = tx.Exec(`INSERT INTO active_games
-			(game_id, white_key, white_name, black_key, black_name, board, turn, state, legal_moves, in_check, version)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			e.GameID, d.White.Key, d.White.Name, d.Black.Key, d.Black.Name,
-			game.Board.Placement(), game.CurrentTurn.Name(), state, moves, game.IsInCheck(game.CurrentTurn), e.Version)
-		return err
+		return insertActiveGame(tx, e.GameID, d.White, d.Black, NewGame(), e.Version)
 
 	case EventMoveMade:
 		var state string
-		if err := tx.QueryRow(`SELECT state FROM active_games WHERE game_id = ?`, e.GameID).Scan(&state); err != nil {
+		err := tx.QueryRow(`SELECT state FROM active_games WHERE game_id = ?`, e.GameID).Scan(&state)
+		if errors.Is(err, sql.ErrNoRows) {
+			return restoreActiveGame(tx, e)
+		}
+		if err != nil {
 			return fmt.Errorf("move for game %s: %w", e.GameID, err)
 		}
 		var game Game
@@ -99,6 +94,34 @@ func (ActiveGames) Apply(tx *sql.Tx, e Event) error {
 		return err
 	}
 	return nil
+}
+
+// restoreActiveGame rebuilds a row that someone deleted by hand, from the
+// game's events up to and including e.
+func restoreActiveGame(tx *sql.Tx, e Event) error {
+	events, err := LoadInTx(context.Background(), tx, e.GameID)
+	if err != nil {
+		return err
+	}
+	events = slices.DeleteFunc(events, func(later Event) bool { return later.Version > e.Version })
+	a, err := LoadGameAggregate(e.GameID, events)
+	if err != nil {
+		return err
+	}
+	return insertActiveGame(tx, e.GameID, a.White, a.Black, a.Game, e.Version)
+}
+
+func insertActiveGame(tx *sql.Tx, gameID string, white, black PlayerRef, game *Game, version int) error {
+	state, moves, err := encodeGame(game)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(`INSERT INTO active_games
+		(game_id, white_key, white_name, black_key, black_name, board, turn, state, legal_moves, in_check, version)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		gameID, white.Key, white.Name, black.Key, black.Name,
+		game.Board.Placement(), game.CurrentTurn.Name(), state, moves, game.IsInCheck(game.CurrentTurn), version)
+	return err
 }
 
 func encodeGame(g *Game) (state, legalMoves []byte, err error) {

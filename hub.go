@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log"
 	"slices"
 	"sync"
@@ -13,6 +14,7 @@ import (
 var (
 	ErrAlreadyInGame = errors.New("already in a game")
 	ErrSessionGone   = errors.New("session has disconnected or been replaced")
+	ErrNotQueued     = errors.New("not added to the queue")
 )
 
 const (
@@ -41,8 +43,11 @@ type disconnectTimer struct {
 // Hub is a live registry of who is connected, who is waiting for a game, and
 // who is about to lose by disconnecting. It holds no game state.
 //
-// One active game per key holds by construction: a key joins the queue only
-// if it has no active game, and it can be in the queue once.
+// A key joins the queue only if it has no active game, and it can be in the
+// queue once, so it has one active game, with one exception lasting
+// milliseconds. If its session is replaced while startGames is between popping
+// it from the queue and committing GameStarted, and the new session presses
+// Play within that window, the key can end up in two games.
 //
 // mu is never held across a database call: the database has one connection,
 // and Broadcast runs while the projector is working. For the same reason,
@@ -143,11 +148,12 @@ func (h *Hub) findGame(ctx context.Context, playerKey string) (ActiveGame, bool,
 }
 
 // JoinQueue puts a player in line and starts a game if two are waiting. The
-// first in line plays White.
+// first in line plays White. ErrAlreadyInGame and ErrNotQueued mean the player
+// isn't in line; any other error means they are, and their game failed to start.
 func (h *Hub) JoinQueue(ctx context.Context, s *Session) error {
 	_, inGame, err := h.findGame(ctx, s.Player.Key)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %w", ErrNotQueued, err)
 	}
 	if inGame {
 		return ErrAlreadyInGame
@@ -156,7 +162,7 @@ func (h *Hub) JoinQueue(ctx context.Context, s *Session) error {
 	h.mu.Lock()
 	if h.sessions[s.Player.Key] != s {
 		h.mu.Unlock()
-		return ErrSessionGone
+		return fmt.Errorf("%w: %w", ErrNotQueued, ErrSessionGone)
 	}
 	if !slices.Contains(h.queue, s) {
 		h.queue = append(h.queue, s)

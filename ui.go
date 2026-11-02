@@ -72,6 +72,7 @@ type (
 	joinedMsg   struct{ err error }
 	movedMsg    struct{ err error }
 	gameOverMsg struct {
+		gameID string
 		replay Replay
 		err    error
 	}
@@ -197,6 +198,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.message = msg.err.Error()
 			return m, nil
 		}
+		if !msg.replay.Finished { // the row vanished, but the game goes on; the next move restores it
+			m.screen, m.gameID = screenPlaying, msg.gameID
+			return m, nil
+		}
 		m.result = &msg.replay
 		return m, nil
 
@@ -227,7 +232,7 @@ func (m model) route(msg readMsg) (tea.Model, tea.Cmd) {
 			return m, tick()
 		}
 
-	case m.gameID != "": // the row is gone: GameEnded removed it
+	case m.gameID != "": // the row is gone: GameEnded removed it, if the events agree
 		gameID := m.gameID
 		m.screen, m.gameID, m.selected, m.result = screenGameOver, "", nil, nil
 		return m, m.loadResult(gameID)
@@ -249,6 +254,9 @@ func (m model) handleJoined(msg joinedMsg) (tea.Model, tea.Cmd) {
 	if !m.queued { // Esc came while JoinQueue was still running
 		m.app.Hub.LeaveQueue(m.session)
 		return m, nil
+	}
+	if errors.Is(msg.err, ErrNotQueued) {
+		m.screen, m.queued = screenMenu, false
 	}
 	if msg.err != nil {
 		m.message = msg.err.Error()
@@ -435,7 +443,7 @@ func (m model) loadResult(gameID string) tea.Cmd {
 			return gameOverMsg{err: err}
 		}
 		replay, err := BuildReplay(events)
-		return gameOverMsg{replay, err}
+		return gameOverMsg{gameID, replay, err}
 	}
 }
 
@@ -649,8 +657,10 @@ func resultLine(r Replay, playerKey string) string {
 			return "Your opponent left the game. You win."
 		}
 		return fmt.Sprintf("You left the game. %s wins.", winner)
+	case OutcomeCheckmate:
+		return fmt.Sprintf("Checkmate. %s wins.", winner)
 	}
-	return fmt.Sprintf("Checkmate. %s wins.", winner)
+	return "The game has no result."
 }
 
 func opponentColor(c Color) Color {

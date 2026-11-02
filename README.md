@@ -42,9 +42,9 @@ A menu offers **Play** and **My games** (up and down choose, `Enter` selects). P
 | Arrow keys or `h` `j` `k` `l` | Move the cursor |
 | `Space` or `Enter` | Select a piece, then choose its destination |
 | `Esc` | Clear your selection (or leave the queue) |
-| `q` or `Ctrl+C` | Quit |
+| `q` or `Ctrl+C` | Quit. Mid-game, this starts your 30-second clock: come back in time or you lose by resignation |
 
-Games end by checkmate or stalemate. When one ends, press any key to return to the menu.
+Games end by checkmate, stalemate, or resignation, which happens when a player stays away for 30 seconds. When one ends, press any key to return to the menu.
 
 **My games** lists your finished games, newest first. Press `Enter` to replay one, `left` and `right` (or `h` and `l`) to step through its moves, and `Esc` to go back.
 
@@ -97,7 +97,7 @@ go build -o /tmp/chessh . && /tmp/chessh --local --db /tmp/chessh-demo.db
 **Watch the events** as moves are played:
 
 ```bash
-sqlite3 /tmp/chessh-demo.db "SELECT sequence, game_id, version, type, data FROM events;"
+sqlite3 -cmd ".timeout 5000" /tmp/chessh-demo.db "SELECT sequence, game_id, version, type, data FROM events;"
 ```
 
 **Rebuild a projection** while players are connected. Both boards come back and the next move works:
@@ -108,7 +108,7 @@ sqlite3 -cmd ".timeout 5000" /tmp/chessh-demo.db "DROP TABLE my_games;"
 sqlite3 -cmd ".timeout 5000" /tmp/chessh-demo.db "DELETE FROM projection_checkpoints WHERE projection='my_games';"
 ```
 
-The projector notices a missing table or checkpoint and replays every event into a new one.
+The projector notices a missing table or checkpoint and replays every event into a new one. Drop the table; don't `DELETE FROM` it.
 
 **Kill the server mid-game**, start it again with the same command, and reconnect within 30 seconds: both players are back at the same position, because the game is its events.
 

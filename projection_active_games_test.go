@@ -157,3 +157,82 @@ func TestQueriesReportUnavailableAfterDrop(t *testing.T) {
 		t.Fatalf("ListActiveGames: err=%v", err)
 	}
 }
+
+func TestActiveGameRestoredAfterDeleteFrom(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		moves []string // after the delete, White first, all in one catch-up
+	}{
+		{"one move", []string{"g1f3"}},
+		{"several moves", []string{"g1f3", "b8c6", "f1c4"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			db := testDB(t)
+			store := NewEventStore(db)
+			commands := NewCommands(store, nil)
+			projector := NewProjector(db, store, nil, ActiveGames{})
+			ctx := context.Background()
+			move := func(key, m string) {
+				t.Helper()
+				if err := commands.MakeMove(ctx, "g1", key, sq(t, m[:2]), sq(t, m[2:])); err != nil {
+					t.Fatalf("move %s: %v", m, err)
+				}
+			}
+
+			if err := commands.StartGame(ctx, "g1", alice, bob); err != nil {
+				t.Fatal(err)
+			}
+			move(alice.Key, "e2e4")
+			move(bob.Key, "e7e5")
+			if err := projector.CatchUp(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := db.Exec(`DELETE FROM active_games`); err != nil {
+				t.Fatal(err)
+			}
+			for i, m := range tt.moves {
+				key := alice.Key
+				if i%2 == 1 {
+					key = bob.Key
+				}
+				move(key, m)
+			}
+			if err := projector.CatchUp(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			events, err := store.Load(ctx, "g1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			want, err := LoadGameAggregate("g1", events)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, found, err := GetActiveGame(ctx, db, "g1")
+			if err != nil || !found {
+				t.Fatalf("found=%v err=%v", found, err)
+			}
+			if got.White != alice || got.Black != bob || got.Version != want.Version {
+				t.Fatalf("white=%v black=%v version=%d, want version %d", got.White, got.Black, got.Version, want.Version)
+			}
+			if !reflect.DeepEqual(got.Game, want.Game) {
+				t.Fatalf("game state differs:\n%+v\n%+v", got.Game, want.Game)
+			}
+			if !reflect.DeepEqual(got.LegalMoves, want.Game.LegalMoves()) {
+				t.Fatal("legal moves differ from the aggregate's")
+			}
+
+			if err := commands.StartGame(ctx, "g2", carol, dave); err != nil {
+				t.Fatal(err)
+			}
+			if err := projector.CatchUp(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if _, found, err := GetActiveGame(ctx, db, "g2"); err != nil || !found {
+				t.Fatalf("new game: found=%v err=%v", found, err)
+			}
+		})
+	}
+}

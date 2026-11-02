@@ -287,8 +287,9 @@ func TestJoinQueueRefusesReplacedSession(t *testing.T) {
 	first := f.hub.Connect(ctx, alice)
 	f.hub.Connect(ctx, alice)
 
-	if err := f.hub.JoinQueue(ctx, first); !errors.Is(err, ErrSessionGone) {
-		t.Fatalf("got %v, want ErrSessionGone", err)
+	err := f.hub.JoinQueue(ctx, first)
+	if !errors.Is(err, ErrSessionGone) || !errors.Is(err, ErrNotQueued) {
+		t.Fatalf("got %v, want ErrSessionGone and ErrNotQueued", err)
 	}
 }
 
@@ -638,5 +639,38 @@ func TestMakeMoveRejectsWrongGame(t *testing.T) {
 	}
 	if err := f.hub.MakeMove(ctx, white, gameID, sq(t, "e2"), sq(t, "e4")); err != nil {
 		t.Fatalf("a player's own move failed: %v", err)
+	}
+}
+
+func TestJoinQueueFailureSaysNotQueued(t *testing.T) {
+	f := newHubFixture(t, longTimeout)
+	session := f.hub.Connect(context.Background(), carol)
+	busy := errors.New("busy")
+	f.hub.catchUp = func(context.Context) error { return busy }
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // no retries
+
+	err := f.hub.JoinQueue(ctx, session)
+	if !errors.Is(err, ErrNotQueued) || !errors.Is(err, busy) {
+		t.Fatalf("got %v, want ErrNotQueued wrapping the cause", err)
+	}
+	if got := hubQueue(f.hub); len(got) != 0 {
+		t.Fatalf("queue has %d players, want 0", len(got))
+	}
+}
+
+func TestFailedStartIsNotNotQueued(t *testing.T) {
+	f := newHubFixture(t, longTimeout)
+	ctx := context.Background()
+	if _, err := f.db.Exec(`CREATE TRIGGER refuse BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT, 'boom'); END`); err != nil {
+		t.Fatal(err)
+	}
+	f.join(alice)
+	err := f.hub.JoinQueue(ctx, f.hub.Connect(ctx, bob))
+	if err == nil || errors.Is(err, ErrNotQueued) {
+		t.Fatalf("got %v, want a failure that leaves both players in line", err)
+	}
+	if got := hubQueue(f.hub); len(got) != 2 {
+		t.Fatalf("queue has %d players, want 2", len(got))
 	}
 }
